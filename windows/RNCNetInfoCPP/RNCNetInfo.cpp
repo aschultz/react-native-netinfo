@@ -105,19 +105,36 @@ namespace winrt::ReactNativeNetInfo::implementation {
         co_return nullptr;
     }
 
+
+    IAsyncAction ChainGetNetworkStatus(IAsyncAction previousRequest, std::future<NetInfoState> currentRequest, std::function<void(NetInfoState)> onComplete) {
+        try {
+            auto state = co_await currentRequest;
+            if (previousRequest) {
+                co_await previousRequest;
+            }
+            onComplete(state);
+        }
+        catch (...) {}
+    }
+
     void RNCNetInfo::Initialize(winrt::Microsoft::ReactNative::ReactContext const& /*reactContext*/) noexcept {
 
         // NetworkStatusChanged callback is captured by value on purpose. The event handler is called asynchronously and thus can fire even
         // after we've already revoked it in our destructor during module teardown. In such a case, a reference
         // to "this" or "this->NetworkStatusChanged" would be invalid.
-        m_networkStatusChangedRevoker = NetworkInformation::NetworkStatusChanged(winrt::auto_revoke, [callback = NetworkStatusChanged](const winrt::IInspectable& /*sender*/) -> winrt::fire_and_forget {
-            try {
-                // Copy lambda capture into a local so it still exists after the co_await.
-                auto localCallback = callback;
-                localCallback(co_await GetNetworkStatus());
+        m_networkStatusChangedRevoker = NetworkInformation::NetworkStatusChanged(winrt::auto_revoke, [callback = NetworkStatusChanged, previousRequest = IAsyncAction(nullptr), mutex = std::make_unique<std::mutex>()](const winrt::IInspectable& /*sender*/) mutable {
+            // Kick off building a status object. Most of this will run synchronously, but getting extra WiFi details will run async at the end.
+            auto currentRequest = GetNetworkStatus();
+
+            // To guarantee ordering of events sent to JS, wait for any previous NetworkStatusChanged events to be processed.
+            // We atomically swap our latest request into place so that the next downstream NetworkStatusChanged can wait on us.
+            // Note that we're NOT blocking inside the lock. Either ChainGetNetworkStatus completes synchronously or it hits real async work and yields. But we don't
+            // wait on the response, we just store the IAsyncAction object.
+            {
+                std::scoped_lock lock(*mutex);
+                previousRequest = ChainGetNetworkStatus(previousRequest, std::move(currentRequest), callback);
             }
-            catch (...) {}
-            });
+        });
     }
 
     winrt::fire_and_forget RNCNetInfo::getCurrentState(std::string requestedInterface, winrt::Microsoft::ReactNative::ReactPromise<NetInfoState> promise) noexcept {
